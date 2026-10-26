@@ -56,6 +56,11 @@ public class ParentService extends Service {
     private static final int LOST_ID = 4;
     /** Sans nouvelles du bébé pendant 50 s → alerte « déconnecté ». */
     private static final long HEARTBEAT_TIMEOUT_MS = 50_000;
+    /**
+     * Avant d'alerter « déconnecté », on force une reconnexion et on laisse
+     * ce délai au téléphone bébé pour redonner signe de vie (micro-coupures Wi-Fi).
+     */
+    private static final long GRACE_MS = 20_000;
     private static final long AUTO_LISTEN_MS = 30_000;
     private static final long MANUAL_LISTEN_MS = 15 * 60_000;
 
@@ -84,7 +89,10 @@ public class ParentService extends Service {
     private PowerManager.WakeLock reconnectLock;
     private PowerManager.WakeLock listenLock;
     private WifiManager.WifiLock listenWifiLock;
-    private boolean lostNotified = false;
+    private volatile boolean lostNotified = false;
+    private boolean graceActive = false;
+    private PowerManager.WakeLock graceLock;
+    private final Runnable graceCheck = () -> endGrace();
     private boolean triedLastIp = false;
 
     @Override
@@ -100,6 +108,8 @@ public class ParentService extends Service {
         PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
         reconnectLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "babyphone:reconnect");
         reconnectLock.setReferenceCounted(false);
+        graceLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "babyphone:grace");
+        graceLock.setReferenceCounted(false);
         listenLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "babyphone:listen");
         listenLock.setReferenceCounted(false);
         WifiManager wm = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
@@ -159,6 +169,9 @@ public class ParentService extends Service {
         if (netThread != null) netThread.interrupt();
         cancelWatchdog();
         if (reconnectLock.isHeld()) reconnectLock.release();
+        main.removeCallbacks(graceCheck);
+        graceActive = false;
+        if (graceLock.isHeld()) graceLock.release();
         if (nm != null) nm.cancel(LOST_ID);
         status = "Arrêté";
         sender.shutdown();
@@ -386,7 +399,23 @@ public class ParentService extends Service {
         if (!running) return;
         long since = System.currentTimeMillis() - lastHeartbeat;
         if (since <= HEARTBEAT_TIMEOUT_MS) return;
-        if (!lostNotified) {
+        // Force une reconnexion propre (le téléphone bébé renvoie un signe
+        // de vie dès qu'on se reconnecte).
+        closeSocketAsync();
+        if (lostNotified || graceActive) return;
+        // Pas d'alerte tout de suite : on laisse le temps de se reconnecter.
+        graceActive = true;
+        graceLock.acquire(GRACE_MS + 10_000);
+        main.postDelayed(graceCheck, GRACE_MS);
+    }
+
+    /** Fin du délai de grâce : toujours rien ? Alors on alerte. */
+    private void endGrace() {
+        graceActive = false;
+        try {
+            if (!running) return;
+            long since = System.currentTimeMillis() - lastHeartbeat;
+            if (since <= HEARTBEAT_TIMEOUT_MS || lostNotified) return;
             lostNotified = true;
             if (nm != null) {
                 nm.notify(LOST_ID, Notifs.alert(this, "⚠️ Babyphone déconnecté",
@@ -394,9 +423,9 @@ public class ParentService extends Service {
                                 + " s. Vérifie le Wi-Fi et la batterie."));
             }
             ring();
+        } finally {
+            if (graceLock.isHeld()) graceLock.release();
         }
-        // Force une reconnexion propre.
-        closeSocketAsync();
     }
 
     // ---------------------------------------------------------------- alertes
